@@ -80,6 +80,33 @@ from agent_skills import (
 from ddgs import DDGS
 import time
 
+# LLM Generator imports (for --llm-forge mode)
+try:
+    from modules.llm_generator import (
+        generate_full_spec,
+        LLMProvider,
+        GenerationResult,
+    )
+    from modules.text_normalizer import normalize_evidence_text
+    LLM_GENERATOR_AVAILABLE = True
+except ImportError:
+    LLM_GENERATOR_AVAILABLE = False
+    print("[WARNING] LLM generator module not available. Install with: pip install anthropic")
+
+# Quality Validator imports (for real content validation)
+try:
+    from modules.quality_validator import (
+        validate_spec_quality,
+        quick_quality_check,
+        get_quality_grade,
+        QualityGrade,
+        QualityResult,
+    )
+    QUALITY_VALIDATOR_AVAILABLE = True
+except ImportError:
+    QUALITY_VALIDATOR_AVAILABLE = False
+    print("[WARNING] Quality validator module not available.")
+
 logger = logging.getLogger("sa_docgen_synth")
 
 
@@ -518,13 +545,13 @@ def validate_and_save_v3(
     safe_name = system_name.lower().replace(" ", "-").replace("/", "-")
     final_filename = f"{safe_name}_v3-0_{timestamp}.md"
 
-    # Run V3.0 Hard-Gate Audit
+    # Run V3.0 Hard-Gate Audit (structural checks)
     audit = v3_principal_audit(content, system_name)
 
     if not audit["passed"]:
         print()
         print("=" * 70)
-        print("V3.0 HARD-GATE REJECTION")
+        print("V3.0 HARD-GATE REJECTION (Structural)")
         print("=" * 70)
         for failure in audit["failures"]:
             print(f"  [FAIL] {failure}")
@@ -539,6 +566,68 @@ def validate_and_save_v3(
             "message": "Content failed V3.0 Hard-Gate audit. Fix failures and retry.",
         }
 
+    # Run REAL Quality Validation (content quality checks)
+    if QUALITY_VALIDATOR_AVAILABLE:
+        print()
+        print("-" * 70)
+        print("QUALITY VALIDATION (Content Analysis)")
+        print("-" * 70)
+
+        quality_result = validate_spec_quality(content, target_slug)
+
+        print(f"  Source Authority:    {quality_result.source_authority_score:.0%}")
+        print(f"  Product Relevance:   {quality_result.product_relevance_score:.0%}")
+        print(f"  Text Quality:        {quality_result.text_quality_score:.0%}")
+        print(f"  Content Coherence:   {quality_result.content_coherence_score:.0%}")
+        print(f"  Overall Score:       {quality_result.overall_score:.2f}/3.0")
+        print(f"  Grade:               {quality_result.grade.value}")
+
+        if quality_result.warnings:
+            print()
+            print("  Warnings:")
+            for warning in quality_result.warnings[:5]:
+                print(f"    - {warning}")
+
+        if quality_result.issues:
+            print()
+            print("  Issues (blocking):")
+            for issue in quality_result.issues:
+                print(f"    - {issue}")
+
+        # Use REAL grade from quality validator
+        final_grade = quality_result.grade.value
+        final_score = quality_result.overall_score
+
+        # Reject if quality validation fails
+        if not quality_result.passed:
+            print()
+            print("=" * 70)
+            print(f"QUALITY VALIDATION FAILED - {final_grade}")
+            print("=" * 70)
+            print()
+            print("Content passed structural checks but FAILED quality validation.")
+            print("Fix the quality issues above and retry.")
+            print()
+
+            return {
+                "success": False,
+                "status": "REJECTED",
+                "audit": audit,
+                "quality_result": {
+                    "grade": final_grade,
+                    "score": final_score,
+                    "issues": quality_result.issues,
+                    "warnings": quality_result.warnings,
+                },
+                "message": f"Content failed quality validation: {'; '.join(quality_result.issues)}",
+            }
+    else:
+        # Fallback if quality validator not available (should not happen)
+        print()
+        print("[WARNING] Quality validator not available - using structural audit only")
+        final_grade = "ACCEPTABLE"  # Conservative grade without quality validation
+        final_score = 2.0
+
     # Passed! Save the artifact
     output_path = home_silo / final_filename
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -548,30 +637,32 @@ def validate_and_save_v3(
 
     print()
     print("=" * 70)
-    print("V3.0 HARD-GATE PASSED - ELITE GRADE")
+    print(f"V3.0 HARD-GATE PASSED - {final_grade} GRADE")
     print("=" * 70)
     print(f"  File: {output_path}")
     print(f"  Size: {byte_size} bytes")
-    print(f"  Checks: {audit['checks_passed']}/{audit['checks_run']} passed")
+    print(f"  Score: {final_score:.2f}/3.0")
+    print(f"  Structural Checks: {audit['checks_passed']}/{audit['checks_run']} passed")
     print()
 
-    # Update registry
+    # Update registry with REAL grade
     registry = get_registry()
     registry.update_registry(
         target_slug=target_slug,
         tech_spec_exists=True,
-        grade="ELITE",
-        score=3.0,
+        grade=final_grade,
+        score=final_score,
         filename=final_filename,
     )
 
     return {
         "success": True,
-        "status": "ELITE",
+        "status": final_grade,
         "output_path": str(output_path),
         "byte_size": byte_size,
         "audit": audit,
         "filename": final_filename,
+        "quality_score": final_score,
     }
 
 
@@ -1898,6 +1989,8 @@ def harvest_refine(
     search_function: Optional[callable] = None,
     auto_forge: bool = True,
     use_registry: bool = True,
+    llm_forge: bool = False,
+    llm_provider: str = "anthropic",
 ) -> Dict[str, Any]:
     """
     Execute the Harvest & Refine workflow for a target system.
@@ -1916,12 +2009,20 @@ def harvest_refine(
     - Raises TruthGapError if insufficient Physical Truth
     - Auto-updates registry after successful forge
 
+    LLM Forge Mode (--llm-forge):
+    - Instead of template-filling with evidence snippets, uses LLM to generate
+      coherent prose documentation using evidence as grounding context
+    - Produces professional, readable technical specifications
+    - Requires ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable
+
     Args:
         target: Target system slug (e.g., "adobe-rtcdp", "sap-event-mesh")
         project: [R01] Project flag for domain isolation
         search_function: Optional web search function for research
         auto_forge: If True, automatically run glossy_v3 forge after healing
         use_registry: If True, use RegistryResolver for Seed Flip and persistence
+        llm_forge: If True, use LLM-based content generation instead of templates
+        llm_provider: LLM provider for llm_forge mode ("anthropic" or "openai")
 
     Returns:
         Dict with results from each phase
@@ -2244,34 +2345,144 @@ def harvest_refine(
         print("  Auto-forge disabled. Skipping...")
         results["phases"]["final_strike"] = {"success": False, "skipped": True}
     else:
-        # Run pre-forge audit
-        print("  Running pre-forge audit...")
-        pre_audit = quick_audit(sanitized_content)
-        print(f"  Pre-Forge Grade: {pre_audit['grade']} ({pre_audit['score']}/3.0)")
-
-        # Inject glossary references
-        print("  Injecting glossary references...")
-        glossy_content = inject_glossary_references(sanitized_content)
-        glossy_content = inject_glossary_appendix(glossy_content)
-
-        # Generate V3.0 Blueprint using product_name for system name
-        # V3.1 Fix: Use actual product_name when --project is set
-        print("  Generating V3.0 Blueprint...")
+        # Determine system name
         if project:
-            # Project flag set - use actual product name
             forge_system_name = f"{product_name} Integration"
         else:
-            # No project - use Vendor- prefix (domain isolated)
             forge_system_name = f"Vendor-{target.replace('-', '')} Integration"
         print(f"  System Name: {forge_system_name}")
-        blueprint_result = generate_blueprint_v2(
-            system_name=forge_system_name,
-            content=glossy_content,
-            platform="Claude",
-            model="claude-opus-4-5-20251101",
-        )
+
+        # ============================================================
+        # LLM FORGE MODE: Generate content using LLM
+        # ============================================================
+        if llm_forge and LLM_GENERATOR_AVAILABLE:
+            print()
+            print("  [LLM FORGE MODE] Generating content via LLM...")
+            print(f"  Provider: {llm_provider}")
+
+            # Convert evidence to format expected by LLM generator
+            evidence_by_pillar = {}
+            if research_report and hasattr(research_report, 'evidence_by_pillar'):
+                evidence_by_pillar = research_report.evidence_by_pillar
+
+            total_evidence = sum(len(e) for e in evidence_by_pillar.values())
+            print(f"  Evidence Items: {total_evidence} across {len(evidence_by_pillar)} pillars")
+
+            # Call LLM generator
+            try:
+                llm_provider_enum = LLMProvider(llm_provider.lower())
+            except (ValueError, NameError):
+                llm_provider_enum = LLMProvider.ANTHROPIC
+
+            llm_result = generate_full_spec(
+                system_name=product_name if use_registry else target,
+                evidence_by_pillar=evidence_by_pillar,
+                provider=llm_provider_enum
+            )
+
+            if llm_result.success:
+                print(f"  [LLM FORGE] SUCCESS - {len(llm_result.content)} chars generated")
+                print(f"  [LLM FORGE] Tokens used: {llm_result.tokens_used}")
+                print(f"  [LLM FORGE] Model: {llm_result.model}")
+
+                # Build the final document with LLM content
+                llm_content = f"# {forge_system_name}\n\n"
+                llm_content += f"*Generated via LLM Forge Mode ({llm_result.model})*\n\n"
+                llm_content += "---\n\n"
+                llm_content += llm_result.content
+
+                # Inject glossary references
+                print("  Injecting glossary references...")
+                glossy_content = inject_glossary_references(llm_content)
+                glossy_content = inject_glossary_appendix(glossy_content)
+
+                # Run blueprint generation for audit and metadata
+                blueprint_result = generate_blueprint_v2(
+                    system_name=forge_system_name,
+                    content=glossy_content,
+                    platform=llm_result.provider.title(),
+                    model=llm_result.model,
+                )
+            else:
+                print(f"  [LLM FORGE] FAILED: {llm_result.error}")
+                print("  [LLM FORGE] Falling back to template mode...")
+                llm_forge = False  # Fall through to template mode
+
+        # ============================================================
+        # TEMPLATE MODE: Original template-filling approach
+        # ============================================================
+        if not llm_forge or not LLM_GENERATOR_AVAILABLE:
+            if llm_forge and not LLM_GENERATOR_AVAILABLE:
+                print("  [WARNING] LLM generator not available. Using template mode.")
+                print("  [INFO] Install with: pip install anthropic")
+
+            # Run pre-forge audit
+            print("  Running pre-forge audit...")
+            pre_audit = quick_audit(sanitized_content)
+            print(f"  Pre-Forge Grade: {pre_audit['grade']} ({pre_audit['score']}/3.0)")
+
+            # Inject glossary references
+            print("  Injecting glossary references...")
+            glossy_content = inject_glossary_references(sanitized_content)
+            glossy_content = inject_glossary_appendix(glossy_content)
+
+            # Generate V3.0 Blueprint
+            print("  Generating V3.0 Blueprint (template mode)...")
+            blueprint_result = generate_blueprint_v2(
+                system_name=forge_system_name,
+                content=glossy_content,
+                platform="Claude",
+                model="claude-opus-4-5-20251101",
+            )
 
         audit_result = blueprint_result["audit_report"]
+        structural_grade = audit_result["grade"]
+        structural_score = audit_result["weighted_mean"]
+
+        # ============================================================
+        # QUALITY VALIDATION (Real Content Analysis)
+        # ============================================================
+        final_grade = structural_grade
+        final_score = structural_score
+        quality_result = None
+
+        if QUALITY_VALIDATOR_AVAILABLE:
+            print()
+            print("-" * 70)
+            print("QUALITY VALIDATION (Content Analysis)")
+            print("-" * 70)
+
+            quality_result = validate_spec_quality(blueprint_result["markdown"], target)
+
+            print(f"  Source Authority:    {quality_result.source_authority_score:.0%}")
+            print(f"  Product Relevance:   {quality_result.product_relevance_score:.0%}")
+            print(f"  Text Quality:        {quality_result.text_quality_score:.0%}")
+            print(f"  Content Coherence:   {quality_result.content_coherence_score:.0%}")
+            print(f"  Quality Score:       {quality_result.overall_score:.2f}/3.0")
+            print(f"  Quality Grade:       {quality_result.grade.value}")
+
+            if quality_result.warnings:
+                print()
+                print("  Warnings:")
+                for warning in quality_result.warnings[:3]:
+                    print(f"    - {warning}")
+
+            if quality_result.issues:
+                print()
+                print("  Issues (blocking):")
+                for issue in quality_result.issues:
+                    print(f"    - {issue}")
+
+            # Use QUALITY grade (more accurate) instead of structural grade
+            # Quality validation is more stringent and catches content issues
+            final_grade = quality_result.grade.value
+            final_score = quality_result.overall_score
+
+            # If structural was ELITE but quality is lower, downgrade
+            if structural_grade == "ELITE" and final_grade != "ELITE":
+                print()
+                print(f"  [Grade Correction] Structural: {structural_grade} -> Quality: {final_grade}")
+                print(f"  [Reason] Content quality validation found issues")
 
         # ============================================================
         # AUTO-PERSISTENCE TO HOME SILO
@@ -2296,12 +2507,12 @@ def harvest_refine(
             print(f"    {output_path}")
 
         print()
-        print(f"  Final Grade: {audit_result['grade']}")
-        print(f"  Final Score: {audit_result['weighted_mean']}/3.0")
+        print(f"  Structural Grade: {structural_grade} ({structural_score}/3.0)")
+        print(f"  Final Grade: {final_grade} ({final_score}/3.0)")
         print(f"  Pillars Passed: {audit_result['pillars_passed']}/{audit_result['total_pillars']}")
 
         # ============================================================
-        # REGISTRY STATE SYNC
+        # REGISTRY STATE SYNC (with REAL grade)
         # ============================================================
         if use_registry and registry:
             print()
@@ -2309,20 +2520,25 @@ def harvest_refine(
             registry.update_registry(
                 target_slug=target,
                 tech_spec_exists=True,
-                grade=audit_result["grade"],
-                score=audit_result["weighted_mean"],
+                grade=final_grade,  # Use quality-validated grade
+                score=final_score,  # Use quality-validated score
             )
-            print(f"  [Registry State Sync] Complete")
+            print(f"  [Registry State Sync] Complete (Grade: {final_grade})")
 
         results["phases"]["final_strike"] = {
             "success": True,
-            "grade": audit_result["grade"],
-            "score": audit_result["weighted_mean"],
+            "structural_grade": structural_grade,
+            "structural_score": structural_score,
+            "final_grade": final_grade,
+            "final_score": final_score,
+            "grade": final_grade,  # Backwards compatibility
+            "score": final_score,  # Backwards compatibility
             "pillars_passed": audit_result["pillars_passed"],
             "pillars_total": audit_result["total_pillars"],
             "output_path": str(output_path),
             "home_silo": str(home_silo) if home_silo else None,
             "registry_synced": use_registry and registry is not None,
+            "quality_validated": QUALITY_VALIDATOR_AVAILABLE,
         }
 
     # ============================================================
@@ -2692,6 +2908,23 @@ def main():
         ),
     )
 
+    # LLM Generation Mode
+    parser.add_argument(
+        "--llm-forge",
+        action="store_true",
+        help=(
+            "Use LLM-based content generation instead of template filling. "
+            "Produces coherent prose instead of pasted evidence snippets. "
+            "Requires ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable."
+        ),
+    )
+    parser.add_argument(
+        "--llm-provider",
+        choices=["anthropic", "openai"],
+        default="anthropic",
+        help="LLM provider for --llm-forge mode (default: anthropic)"
+    )
+
     args = parser.parse_args()
 
     # ============================================================
@@ -2735,6 +2968,8 @@ def main():
                     search_function=live_search,  # Enable live web search
                     auto_forge=True,
                     use_registry=True,
+                    llm_forge=args.llm_forge,
+                    llm_provider=args.llm_provider,
                 )
 
                 if result.get("success"):
@@ -2861,6 +3096,8 @@ def main():
             project=args.project,
             search_function=live_search,  # Enable live web search
             auto_forge=True,
+            llm_forge=args.llm_forge,
+            llm_provider=args.llm_provider,
         )
         # Print JSON summary
         print()
