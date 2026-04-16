@@ -44,6 +44,7 @@ AUTHORITY_WEIGHTS = {
     "developers.sap.com": 0.95,
     "www.sap.com": 0.9,
     "sap.com": 0.9,
+    ".sap": 0.9,  # SAP cloud domains (*.services.cloud.sap, *.em.services.cloud.sap)
     "community.sap.com": 0.7,
     "blogs.sap.com": 0.65,
     "news.sap.com": 0.6,
@@ -268,10 +269,20 @@ def score_source_authority(urls: List[str]) -> Tuple[float, Dict[str, int]]:
 
         # Find matching weight
         weight = AUTHORITY_WEIGHTS.get("_default")
-        for pattern, w in AUTHORITY_WEIGHTS.items():
-            if pattern in domain:
-                weight = w
-                break
+
+        # Check exact match first
+        if domain in AUTHORITY_WEIGHTS:
+            weight = AUTHORITY_WEIGHTS[domain]
+        else:
+            # Check suffix match (for patterns like .sap, .adobe.com)
+            for pattern, w in AUTHORITY_WEIGHTS.items():
+                if pattern != "_default":
+                    if pattern.startswith('.') and domain.endswith(pattern):
+                        weight = w
+                        break
+                    elif pattern in domain:
+                        weight = w
+                        break
 
         total_weight += weight
 

@@ -50,6 +50,7 @@ AUTHORITY_WEIGHTS = {
     "developers.sap.com": 0.95,
     "www.sap.com": 0.9,
     "sap.com": 0.9,
+    ".sap": 0.9,  # SAP cloud domains (*.services.cloud.sap, *.em.services.cloud.sap)
     "community.sap.com": 0.7,
     "blogs.sap.com": 0.65,
     "news.sap.com": 0.6,
@@ -176,10 +177,13 @@ def get_authority_weight(domain: str) -> float:
     if domain in AUTHORITY_WEIGHTS:
         return AUTHORITY_WEIGHTS[domain]
 
-    # Check partial match
+    # Check suffix match (for patterns like .sap, .adobe.com)
     for pattern, weight in AUTHORITY_WEIGHTS.items():
-        if pattern != "_default" and pattern in domain:
-            return weight
+        if pattern != "_default":
+            if pattern.startswith('.') and domain.endswith(pattern):
+                return weight
+            elif pattern in domain:
+                return weight
 
     return AUTHORITY_WEIGHTS["_default"]
 
