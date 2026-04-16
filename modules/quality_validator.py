@@ -211,6 +211,14 @@ def extract_evidence_text(content: str) -> List[str]:
         if match and len(match.group(1)) > 20:
             evidence_items.append(match.group(1))
 
+    # Extract sentences/paragraphs containing citations [text](url)
+    # This handles LLM-generated content with inline citations
+    citation_pattern = r'[^.!?\n]*\[[^\]]+\]\([^)]+\)[^.!?\n]*[.!?]?'
+    citation_matches = re.findall(citation_pattern, content)
+    for match in citation_matches:
+        if len(match) > 30:  # Only substantive sentences
+            evidence_items.append(match.strip())
+
     return evidence_items
 
 
@@ -265,12 +273,21 @@ def score_product_relevance(
     key_terms = [product_slug.lower(), product_name]
 
     # Add component terms (e.g., "event" and "mesh" for "sap-event-mesh")
-    parts = product_slug.replace("sap-", "").split("-")
-    key_terms.extend([p for p in parts if len(p) > 3])
+    # Use len > 2 to include terms like "AEM", "API", "CDN"
+    parts = product_slug.replace("sap-", "").replace("adobe-", "").split("-")
+    key_terms.extend([p.lower() for p in parts if len(p) > 2])
+
+    # Also split on spaces for terms like "AEM Assets"
+    space_parts = product_slug.split(" ")
+    key_terms.extend([p.lower() for p in space_parts if len(p) > 2])
 
     # For SAP products, "sap" and "btp" are always relevant
-    if product_slug.startswith("sap-"):
+    if product_slug.lower().startswith("sap"):
         key_terms.extend(["sap", "btp"])
+
+    # For Adobe products, "adobe", "aem", "experience" are always relevant
+    if "adobe" in product_slug.lower() or "aem" in product_slug.lower():
+        key_terms.extend(["adobe", "aem", "experience", "experience manager"])
 
     relevant_count = 0
     wrong_refs = []
